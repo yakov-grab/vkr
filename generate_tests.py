@@ -231,15 +231,26 @@ class TestGenerator:
         lines = test_code.split('\n')
         cleaned_lines = []
         imported_modules = set()
+        has_fixture = '@fixture' in test_code
+        has_pytest_import = False
+        has_fixture_import = False
         
         for line in lines:
-            if line.startswith('import pytest') or line.startswith('from pytest'):
+            # Проверяем импорты pytest
+            if line.startswith('import pytest'):
+                has_pytest_import = True
+                cleaned_lines.append(line)
+                continue
+                
+            if line.startswith('from pytest import') and 'fixture' in line:
+                has_fixture_import = True
+                cleaned_lines.append(line)
                 continue
                 
             import_match = re.match(r'^from\s+(\w+)(\.\w+)*\s+import', line)
             if import_match:
                 module = import_match.group(1)
-                if module == function_info['module_name'] or module == 'pytest':
+                if module == function_info['module_name']:
                     continue
                 if module in imported_modules:
                     continue
@@ -247,6 +258,10 @@ class TestGenerator:
                 
             cleaned_lines.append(line)
         
+        # Добавляем необходимые импорты если их нет
+        if has_fixture and not has_pytest_import and not has_fixture_import:
+            cleaned_lines.insert(0, 'import pytest')
+            
         while cleaned_lines and not cleaned_lines[0].strip():
             cleaned_lines.pop(0)
         
@@ -307,7 +322,7 @@ Your test should:
 
 Important guidelines:
 - DO NOT import the function being tested, it's already imported from '{module_name}'
-- Include necessary imports for any external libraries used in the test (but not pytest)
+- If you use pytest features like @fixture, make sure to include 'import pytest' at the beginning
 - Use parametrize for testing multiple input/output combinations
 - Use fixtures appropriately for setup/teardown
 - Include proper mocking for external dependencies if needed

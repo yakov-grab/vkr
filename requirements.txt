@@ -4,3 +4,6 @@ datasets
 tqdm
 pytest
 pytest-cov
+codebleu
+tree-sitter-python==0.21
+coverage

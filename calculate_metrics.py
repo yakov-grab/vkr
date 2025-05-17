@@ -16,20 +16,20 @@ import os
 import sys
 import json
 import argparse
-import subprocess
 import tempfile
 import ast
 import re
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Set, Optional
 import numpy as np
 import pytest
 from tqdm import tqdm
-import concurrent.futures
-from functools import lru_cache
+from codebleu import calc_codebleu
+import coverage
 
 sys.path.append('.')
-from generate_v3 import TestGenerator, FunctionExtractor
+from generate_tests import TestGenerator, FunctionExtractor
 
 
 class SyntaxValidator:
@@ -97,15 +97,31 @@ class TestExecutor:
             "skipped": 0,
             "execution_time": 0,
             "error_message": "",
-            "test_details": []
+            "test_details": [],
+            "coverage": {
+                "line_rate": 0.0,
+                "branch_rate": 0.0,
+                "covered_lines": 0,
+                "total_lines": 0
+            }
         }
         
         try:
             with tempfile.TemporaryDirectory() as tempdir:
                 conftest_path = Path(tempdir) / "conftest.py"
-                conftest_path.write_text("")
+                with open(conftest_path, 'w') as f:
+                    f.write("import pytest\n")
                 
                 sys.path.insert(0, str(Path(source_file).parent.absolute()))
+                
+                # Add the proper import for pytest fixture
+                with open(test_file, 'r') as f:
+                    test_content = f.read()
+                
+                if '@fixture' in test_content and 'from pytest import fixture' not in test_content and 'import pytest' not in test_content:
+                    # Add pytest import at the beginning of the file
+                    with open(test_file, 'w') as f:
+                        f.write("import pytest\n" + test_content)
                 
                 items = pytest.main(["--collect-only", test_file, "-v"])
                 if items != 0:
@@ -125,7 +141,58 @@ class TestExecutor:
                                 'message': str(getattr(report, 'longrepr', ''))
                             })
                 
-                exit_code = pytest.main([test_file, "-v"], plugins=[ResultCollector()])
+                # Setup coverage
+                source_module = Path(source_file).stem
+                
+                cov = coverage.Coverage(
+                    source=[source_module],
+                    data_file=str(Path(tempdir) / ".coverage"),
+                    branch=True
+                )
+                
+                try:
+                    cov.start()
+                    exit_code = pytest.main([test_file, "-v"], plugins=[ResultCollector()])
+                    cov.stop()
+                    cov.save()
+                
+                    # Get coverage data
+                    if os.path.exists(str(Path(tempdir) / ".coverage")):
+                        cov.load()
+                        
+                        # Get file data
+                        data = cov.get_data()
+                        if data and source_module in data.measured_files():
+                            file_data = list(data.measured_files())[0]  # Get the first file
+                            
+                            # Get analysis
+                            analysis = cov.analysis2(file_data)
+                            if analysis:
+                                statements = analysis[0]  # executable lines
+                                missing = analysis[1]     # missing lines
+                                branches = analysis[2]    # branches
+                                missing_branches = analysis[3]  # missing branches
+                                
+                                if statements:
+                                    covered_lines = len(statements) - len(missing)
+                                    line_rate = covered_lines / len(statements) if statements else 0
+                                    
+                                    # Calculate branch coverage if available
+                                    branch_rate = 0.0
+                                    if branches:
+                                        covered_branches = len(branches) - len(missing_branches) 
+                                        branch_rate = covered_branches / len(branches) if len(branches) > 0 else 0.0
+                                    
+                                    result["coverage"] = {
+                                        "line_rate": line_rate,
+                                        "branch_rate": branch_rate,
+                                        "covered_lines": covered_lines,
+                                        "total_lines": len(statements),
+                                        "branch_covered": len(branches) - len(missing_branches) if branches else 0,
+                                        "branch_total": len(branches) if branches else 0
+                                    }
+                except Exception as e:
+                    print(f"Error during coverage collection: {e}")
                 
                 result["success"] = exit_code == 0
                 result["total"] = len(pytest_results)
@@ -151,31 +218,27 @@ class CodeBLEUCalculator:
     @staticmethod
     def calculate_code_bleu(generated_code: str, reference_code: str) -> float:
         """
-        Calculate a simplified version of CodeBLEU
+        Calculate CodeBLEU score between generated and reference code.
         
-        Note: This is a simplified implementation. For a complete implementation,
-        consider using the official CodeBLEU implementation.
+        CodeBLEU is a weighted combination of:
+        1. n-gram match (BLEU)
+        2. weighted n-gram match (BLEU-weighted)
+        3. AST match
+        4. data-flow match
         """
-        def tokenize_code(code):
-            code = re.sub(r'([(){}\[\],.;:=+\-*/])', r' \1 ', code)
-            return [token for token in code.split() if token.strip()]
-        
-        gen_tokens = tokenize_code(generated_code)
-        ref_tokens = tokenize_code(reference_code)
-        
-        gen_set = set(gen_tokens)
-        ref_set = set(ref_tokens)
-        
-        if not ref_set:
+        if not generated_code or not reference_code:
+            print("Warning: Empty code provided for CodeBLEU calculation")
             return 0.0
         
-        intersection = len(gen_set.intersection(ref_set))
-        union = len(gen_set.union(ref_set))
+        result = calc_codebleu(
+            [reference_code],
+            [generated_code],
+            lang="python",
+            weights=(0.25, 0.25, 0.25, 0.25),
+            tokenizer=None
+        )
         
-        if union == 0:
-            return 0.0
-            
-        return intersection / union
+        return result['codebleu']
 
 
 class LocalModelTestGenerator:
@@ -454,6 +517,9 @@ class MetricsCollector:
             "total_functions": len(self.dataset),
             "generated_tests": 0,
             "valid_syntax": 0,
+            "total_generation_time": 0,
+            "total_execution_time": 0,
+            "errors": [],
             "items": []
         }
         
@@ -464,6 +530,10 @@ class MetricsCollector:
                 test_generator = TestGenerator(model_name=model_name)
         except Exception as e:
             print(f"Error initializing model {model_name}: {e}")
+            model_results["errors"].append({
+                "type": "model_initialization",
+                "message": str(e)
+            })
             return model_results
         
         dir_name = self.model_dirs[model_name]
@@ -472,6 +542,10 @@ class MetricsCollector:
             try:
                 function_code = item.get("function_code", "")
                 reference_test = item.get("test_code", "")
+                
+                if not function_code or not reference_test:
+                    print(f"Warning: Empty function or test code for item {idx}")
+                    continue
                 
                 temp_func_file = tempfile.NamedTemporaryFile(suffix=".py", delete=False)
                 temp_func_filename = temp_func_file.name
@@ -482,10 +556,25 @@ class MetricsCollector:
                 functions = FunctionExtractor.extract_functions(function_code, temp_func_filename)
                 
                 if not functions:
+                    print(f"Warning: No functions extracted from item {idx}")
                     continue
                 
                 function_info = functions[0]
-                generated_test = test_generator.generate_test(function_info)
+                
+                generation_start = time.time()
+                try:
+                    generated_test = test_generator.generate_test(function_info)
+                except Exception as e:
+                    print(f"Error generating test for item {idx}: {e}")
+                    model_results["errors"].append({
+                        "item_id": idx,
+                        "type": "test_generation",
+                        "message": str(e)
+                    })
+                    continue
+                
+                generation_time = time.time() - generation_start
+                model_results["total_generation_time"] += generation_time
                 
                 syntax_validation = SyntaxValidator.validate_tests(generated_test)
                 
@@ -509,9 +598,26 @@ class MetricsCollector:
                 
                 execution_result = {}
                 if syntax_validation["is_valid"]:
-                    execution_result = TestExecutor.execute_test(temp_test_filename, temp_func_filename)
+                    try:
+                        execution_result = TestExecutor.execute_test(temp_test_filename, temp_func_filename)
+                        model_results["total_execution_time"] += execution_result.get("execution_time", 0)
+                    except Exception as e:
+                        print(f"Error executing test for item {idx}: {e}")
+                        model_results["errors"].append({
+                            "item_id": idx,
+                            "type": "test_execution",
+                            "message": str(e)
+                        })
+                        execution_result = {
+                            "success": False,
+                            "error_message": str(e)
+                        }
                 
-                code_bleu = CodeBLEUCalculator.calculate_code_bleu(generated_test, reference_test)
+                try:
+                    code_bleu = CodeBLEUCalculator.calculate_code_bleu(generated_test, reference_test)
+                except Exception as e:
+                    print(f"Error calculating CodeBLEU for item {idx}: {e}")
+                    code_bleu = 0.0
                 
                 item_result = {
                     "id": idx,
@@ -520,7 +626,8 @@ class MetricsCollector:
                     "generated_test": generated_test,
                     "syntax_validation": syntax_validation,
                     "execution_result": execution_result,
-                    "code_bleu": code_bleu
+                    "code_bleu": code_bleu,
+                    "generation_time": generation_time
                 }
                 
                 model_results["items"].append(item_result)
@@ -535,6 +642,24 @@ class MetricsCollector:
                 
             except Exception as e:
                 print(f"Error processing item {idx}: {e}")
+                model_results["errors"].append({
+                    "item_id": idx,
+                    "type": "general",
+                    "message": str(e)
+                })
+                continue
+        
+        if model_results["generated_tests"] > 0:
+            model_results["average_generation_time"] = model_results["total_generation_time"] / model_results["generated_tests"]
+            model_results["average_execution_time"] = model_results["total_execution_time"] / model_results["generated_tests"]
+        
+        model_results["error_stats"] = {
+            "total_errors": len(model_results["errors"]),
+            "error_types": {
+                error["type"]: sum(1 for e in model_results["errors"] if e["type"] == error["type"])
+                for error in model_results["errors"]
+            }
+        }
         
         with open(self.output_dir / dir_name / "results.json", 'w') as f:
             json.dump(model_results, f, indent=2)
@@ -571,8 +696,27 @@ class MetricsCollector:
                 "passed_percent": np.mean([item["execution_result"].get("passed", 0) / max(1, item["execution_result"].get("total", 1)) * 100 for item in items if item["execution_result"].get("total", 0) > 0]) if items else 0,
                 "failed_percent": np.mean([item["execution_result"].get("failed", 0) / max(1, item["execution_result"].get("total", 1)) * 100 for item in items if item["execution_result"].get("total", 0) > 0]) if items else 0,
                 "error_percent": np.mean([item["execution_result"].get("error", 0) / max(1, item["execution_result"].get("total", 1)) * 100 for item in items if item["execution_result"].get("total", 0) > 0]) if items else 0,
+            },
+            "timing": {
+                "total_generation_time": model_results.get("total_generation_time", 0),
+                "total_execution_time": model_results.get("total_execution_time", 0),
+                "average_generation_time": model_results.get("average_generation_time", 0),
+                "average_execution_time": model_results.get("average_execution_time", 0)
             }
         }
+        
+        # Calculate average code coverage
+        coverage_values = []
+        for item in items:
+            if "execution_result" in item and "coverage" in item["execution_result"]:
+                cov = item["execution_result"]["coverage"]
+                if cov["total_lines"] > 0:
+                    coverage_values.append(cov["line_rate"] * 100)
+                    
+        if coverage_values:
+            metrics["coverage_percent"] = np.mean(coverage_values)
+        else:
+            metrics["coverage_percent"] = 0.0
         
         return metrics
     
@@ -602,16 +746,23 @@ class MetricsCollector:
         
         md_report += "## Model Comparison\n\n"
         
-        md_report += "| Model | Valid Syntax (%) | Pass@1 | Avg. CodeBLEU | Tests Passed (%) | Tests Failed (%) |\n"
-        md_report += "|-------|-----------------|--------|---------------|-----------------|------------------|\n"
+        md_report += "| Model | Total Generated Tests | Skipped Functions | Valid Syntax (%) | Pass@1 | Avg. CodeBLEU | Tests Passed (%) | Tests Failed (%) | Coverage (%) | Avg. Gen Time (s) | Avg. Exec Time (s) |\n"
+        md_report += "|-------|-----------------------|-------------------|------------------|--------|---------------|------------------|------------------|--------------|-------------------|--------------------|\n"
         
         for model_metric in all_results["models"]:
+            skipped = all_results['total_functions'] - model_metric['generated_tests']
             md_report += f"| {model_metric['model']} | "
+            md_report += f"{model_metric['generated_tests']} | "
+            md_report += f"{skipped} | "
             md_report += f"{model_metric['valid_syntax_percent']:.2f} | "
             md_report += f"{model_metric['pass@1']:.2f} | "
             md_report += f"{model_metric['average_code_bleu']:.2f} | "
             md_report += f"{model_metric['test_execution']['passed_percent']:.2f} | "
-            md_report += f"{model_metric['test_execution']['failed_percent']:.2f} |\n"
+            md_report += f"{model_metric['test_execution']['failed_percent']:.2f} | "
+            coverage_percent = model_metric.get('coverage_percent', 0.0)
+            md_report += f"{coverage_percent:.2f} | "
+            md_report += f"{model_metric['timing']['average_generation_time']:.2f} | "
+            md_report += f"{model_metric['timing']['average_execution_time']:.2f} |\n"
         
         report_path = self.output_dir / "comparison_report.md"
         with open(report_path, 'w') as f:
@@ -630,6 +781,7 @@ def main():
     parser.add_argument("--local-model-dir", type=str, default=None, help="Directory containing local model files (overrides model names for local models)")
     parser.add_argument("--cpu-only", action="store_true", help="Force CPU-only mode for model inference (helps with CUDA errors)")
     parser.add_argument("--cuda-debugging", action="store_true", help="Enable CUDA_LAUNCH_BLOCKING=1 for better error messages")
+    parser.add_argument("--skip-coverage", action="store_true", help="Skip coverage measurement to improve performance")
     
     args = parser.parse_args()
     
